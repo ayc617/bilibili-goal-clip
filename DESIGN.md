@@ -37,7 +37,7 @@ Use existing `--font-body`, `--font-reading`, `--font-display` and `--font-mono`
 
 ## Layout
 
-The existing `.content` owns vertical scrolling. Fourth-tab content uses natural height and wrapping at narrow sidebar widths. The hierarchy is goal input, ordered recommendations, collapsible evidence, coverage and supplementary search. Existing chapters and debug details are secondary disclosures. Retain subtitle/overview/notes panels in place. Goal input stays transient in memory rather than a URL because it can contain personal learning intentions.
+The existing `.content` owns vertical scrolling. Fourth-tab content uses natural height and wrapping at narrow sidebar widths. The hierarchy is goal input, ordered recommendations, collapsible evidence, coverage and supplementary search. Existing chapters and debug details are secondary disclosures. Retain subtitle/overview/notes panels in place. Goal drafts and UI metadata are stored separately from analysis evidence in bounded per-video local storage (7 days, up to 20 records); never put goals in URLs. Reopening restores only version-validated evidence and never starts AI automatically.
 
 ## Elevation & Depth
 

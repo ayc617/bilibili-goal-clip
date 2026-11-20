@@ -134,17 +134,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "goalSeek") {
     const bvid = location.pathname.match(/^\/video\/(BV[A-Za-z0-9]{10})(?:\/|$)/)?.[1];
     const video = document.querySelector("video");
-    if (bvid !== message.bvid || getActiveBilibiliPart() !== message.page || !video ||
-        !Number.isFinite(message.seconds) || message.seconds < 0 ||
+    const reject = error => sendResponse({ success: false, error, stage: 'content' });
+    if (bvid !== message.bvid) { reject('SEEK_CONTENT_BVID_MISMATCH'); return false; }
+    if (getActiveBilibiliPart() !== message.page) { reject('SEEK_CONTENT_PART_MISMATCH'); return false; }
+    if (!video) { reject('SEEK_NO_PLAYER'); return false; }
+    if (!Number.isFinite(message.seconds) || message.seconds < 0 ||
         (Number.isFinite(video.duration) && message.seconds > video.duration)) {
-      sendResponse({ success: false, error: "STALE_VIDEO" });
-      return false;
+      reject('SEEK_INVALID_TIME'); return false;
     }
-    video.currentTime = message.seconds;
-    if (video.paused) video.play().catch(() => {});
-    sendResponse({ success: true });
+    try {
+      video.currentTime = message.seconds;
+      if (video.paused) Promise.resolve(video.play()).catch(() => {});
+      sendResponse({ success: true, stage: 'content' });
+    } catch { reject('SEEK_PLAYER_REJECTED'); }
     return false;
   }
+
   debugLog("[YouTube Digest Content] Received message:", message.action, message);
 
   if (message.action === "getVideoInfo") {
@@ -927,26 +932,11 @@ function handleBilibiliNavigation() {
 }
 
 function getActiveBilibiliPart() {
-  const urlPart = Math.max(1, Number(new URL(window.location.href).searchParams.get("p")) || 1);
-  const items = Array.from(
-    document.querySelectorAll(".video-pod__item, .video-episode-card__info"),
-  );
-  const activeIndex = items.findIndex((item) =>
-    item.matches(".active, .video-episode-card__info-playing") ||
-    item.querySelector(".playing, .active"),
-  );
-  const activeItem = activeIndex >= 0 ? items[activeIndex] : null;
-  const activeHref =
-    activeItem?.matches?.("a[href]")
-      ? activeItem.getAttribute("href")
-      : activeItem?.querySelector?.("a[href]")?.getAttribute("href");
-  if (activeHref) {
-    try {
-      const hrefPart = Number(new URL(activeHref, window.location.href).searchParams.get("p"));
-      if (hrefPart > 0) return hrefPart;
-    } catch {}
-  }
-  return activeIndex >= 0 ? activeIndex + 1 : urlPart;
+  const url = new URL(window.location.href);
+  const explicitPart = Number(url.searchParams.get('p'));
+  // Match the sidepanel/background canonical identity, never a stale DOM card index.
+  // A missing p is P1 even when a same-BV collection card still links to P2.
+  return Number.isSafeInteger(explicitPart) && explicitPart > 0 ? explicitPart : 1;
 }
 
 function getBilibiliNavigationUrl() {

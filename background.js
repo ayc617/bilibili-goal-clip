@@ -288,7 +288,9 @@ function updatePanelForTab(tabId, url) {
 
 // A tab navigated to a new URL.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.url || changeInfo.status === "loading") {
+  if (changeInfo.url || changeInfo.status === "loading") invalidateAsr(tabId);
+  const captured = goalSnapshots.get(tabId);
+  if (changeInfo.url && captured && videoKeyFromUrl(changeInfo.url) !== `${captured.video.bvid}@p${captured.video.page}`) {
     goalSnapshots.delete(tabId);
     goalActiveRequests.delete(tabId);
     goalFetchGenerations.delete(tabId);
@@ -316,8 +318,17 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
  * This is like a switchboard — different "actions" trigger different handlers.
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (['prepareAsr', 'confirmAsrDisclosure', 'saveAsrKey', 'startAsr', 'cancelAsr'].includes(message.action)) {
+    // ASR consent/key operations are restricted to packaged extension UI contexts.
+    if (sender.tab || !String(sender.url || '').startsWith(chrome.runtime.getURL(''))) {
+      sendResponse({ success: false, error: 'UNTRUSTED_CONTEXT' }); return false;
+    }
+    handleOptionalAsr(message).then(sendResponse).catch(() =>
+      sendResponse({ success: false, error: 'ASR_FAILED', message: '转写准备或网络请求失败，请检查连接后手动重试。' }));
+    return true;
+  }
   if (message.action === "goalSeek") {
-    handleGoalSeek(message).then(sendResponse).catch(() => sendResponse({ success: false, error: "STALE_VIDEO" }));
+    handleGoalSeek(message).then(sendResponse).catch(() => sendResponse({ success: false, error: 'SEEK_INTERNAL_ERROR', diagnostics:{stage:'background'} }));
     return true;
   }
   if (message.action === "analyzeGoal") {
@@ -655,12 +666,18 @@ async function pollBailianAsrTask(taskId, apiKey) {
 function normalizeBailianTranscript(data) {
   const sentences = data.transcripts?.flatMap((item) => item.sentences || []) || data.sentences || [];
   const transcript = sentences
-    .map((sentence) => ({
+    .map((sentence) => {
+      if (!Number.isFinite(sentence.begin_time) || !Number.isFinite(sentence.end_time) ||
+          sentence.begin_time < 0 || sentence.end_time < sentence.begin_time) {
+        throw new Error("百炼转写 cue 时间戳无效。");
+      }
+      return ({
       text: String(sentence.text || "").trim(),
-      start: Math.max(0, Number(sentence.begin_time || 0) / 1000),
-      duration: Math.max(0, (Number(sentence.end_time || sentence.begin_time || 0) - Number(sentence.begin_time || 0)) / 1000),
+      start: sentence.begin_time / 1000,
+      end: sentence.end_time / 1000,
+      duration: (sentence.end_time - sentence.begin_time) / 1000,
       language: sentence.language || "zh",
-    }))
+    }); })
     .filter((sentence) => sentence.text);
   if (!transcript.length) throw new Error("百炼返回了空转写结果。");
   let plain = "";
@@ -1315,7 +1332,6 @@ async function handleFetchTranscript(
   videoId,
   videoUrl = "",
   requestedPage = 1,
-  { allowAsr = true } = {},
 ) {
   try {
     YTD_SETTINGS.canonicalBilibiliUrl(videoId);
@@ -1331,7 +1347,7 @@ async function handleFetchTranscript(
       error.bilibiliCode = view.code;
       throw error;
     }
-    if (!allowAsr && view.data.bvid && view.data.bvid !== videoId) {
+    if (view.data.bvid && view.data.bvid !== videoId) {
       throw new Error("BVID 与请求的视频不匹配。");
     }
 
@@ -1344,7 +1360,7 @@ async function handleFetchTranscript(
     } catch {}
 
     // Preserve legacy fallback, but never label P1 as a requested Goal part.
-    if (!allowAsr && (!Number.isInteger(part) || !view.data.pages?.[part - 1])) {
+    if (!Number.isInteger(part) || !view.data.pages?.[part - 1]) {
       throw new Error("当前分 P 不存在。");
     }
     const page = view.data.pages?.[part - 1] || view.data.pages?.[0];
@@ -1363,11 +1379,15 @@ async function handleFetchTranscript(
 
     const attempts = [];
 
+    let legacyAi = null;
     const legacy = await bdTryLegacyBilibiliSubtitle(info);
     attempts.push(legacy);
     if (legacy.status === "ok") {
       const resolvedLegacy = await bdResolveTracks(legacy, info);
-      if (resolvedLegacy.status === "success") return resolvedLegacy.result;
+      if (resolvedLegacy.status === "success") {
+        if (resolvedLegacy.result.sourceType === "manual") return resolvedLegacy.result;
+        legacyAi = resolvedLegacy.result;
+      }
       attempts.push(resolvedLegacy);
     }
 
@@ -1375,18 +1395,21 @@ async function handleFetchTranscript(
     attempts.push(webSubtitle);
     if (webSubtitle.status === "ok") {
       const resolvedWeb = await bdResolveTracks(webSubtitle, info);
-      if (resolvedWeb.status === "success") return resolvedWeb.result;
+      if (resolvedWeb.status === "success") {
+        if (resolvedWeb.result.sourceType === "manual") return resolvedWeb.result;
+        return legacyAi || resolvedWeb.result;
+      }
       attempts.push(resolvedWeb);
     }
 
+    if (legacyAi) return legacyAi;
     const providerFailure = bdProviderFailureMessage(attempts);
     if (providerFailure) {
       bdSubtitleLog("[Subtitle] Bilibili subtitle provider failed; ASR will not be started.");
       return { success: false, ...providerFailure };
     }
 
-    // Only after both Bilibili providers returned a genuine "empty" result is
-    // external ASR allowed to run.
+    // Genuine absence only enables the optional UI. It never starts ASR here.
     const legacyEmpty = legacy.status === "empty";
     const webEmpty = webSubtitle.status === "empty";
     if (!legacyEmpty || !webEmpty) {
@@ -1397,30 +1420,9 @@ async function handleFetchTranscript(
       };
     }
 
-    const settings = allowAsr ? await getSettings() : {};
-    if (allowAsr && settings.asrApiKey) {
-      bdSubtitleLog("[Subtitle] Bilibili subtitle unavailable; falling back to ASR.");
-      try {
-        return bdWithAsrMetadata(
-          await transcribeWithBailian(videoId, page.cid, settings.asrApiKey),
-        );
-      } catch (error) {
-        return {
-          success: false,
-          error: "ASR_FAILED",
-          message: error.message || "ASR 转写失败。",
-        };
-      }
-    }
-
-    bdSubtitleLog("[Subtitle] No Bilibili subtitle and ASR is not configured.");
     return {
-      success: false,
-      error: "NO_TRANSCRIPT",
-      message:
-        allowAsr
-          ? "当前视频未找到可用字幕，如需识别无字幕视频，请先配置 ASR。"
-          : "当前视频未找到可用 B站字幕，Goal 本地检索不会启动 ASR。",
+      success: false, error: "NO_TRANSCRIPT", video: info,
+      message: "当前视频未找到可用 B站字幕，可选择生成字幕；不会自动启动 ASR。",
     };
   } catch (error) {
     console.error("[Subtitle] Transcript fetch error:", error);
@@ -1447,14 +1449,27 @@ async function handleFetchGoalTranscript(message) {
     return { success: false, error: "INVALID_VIDEO_PAGE" };
   }
   const fetchGeneration = Symbol();
+  const priorSnapshot = goalSnapshots.get(message.tabId);
   if (Number.isInteger(message.tabId)) {
     goalFetchGenerations.set(message.tabId, fetchGeneration);
     goalSnapshots.delete(message.tabId);
     goalActiveRequests.delete(message.tabId);
   }
-  const result = await handleFetchTranscript(
-    message.bvid, message.videoUrl || "", message.page ?? 1, { allowAsr: false },
+  let result = await handleFetchTranscript(
+    message.bvid, message.videoUrl || "", message.page ?? 1,
   );
+  if (!result.success && result.error === "NO_TRANSCRIPT" && result.video) {
+    const stored = await chrome.storage.local.get(`digest_${message.bvid}@p${result.video.page}`).catch(() => ({}));
+    const cached = priorSnapshot?.video?.sourceType === 'asr' ? priorSnapshot
+      : stored[`digest_${message.bvid}@p${result.video.page}`]?.asrSnapshot;
+    if (cached?.video?.sourceType === 'asr' && String(cached.video.cid) === String(result.video.cid) &&
+        cached.video.bvid === result.video.bvid && cached.video.page === result.video.page) {
+      try {
+        const checked = await GoalTranscriptIndex.createSnapshot({ video: cached.video, cues: cached.cues });
+        if (checked.transcriptHash === cached.transcriptHash) result = asrSnapshotResult(checked);
+      } catch { /* Invalid saved evidence must not trigger transcription. */ }
+    }
+  }
   if (!result.success) return result;
   if ((message.cid != null && String(message.cid) !== String(result.video.cid)) ||
       (message.page != null && message.page !== result.video.page)) {
@@ -2470,29 +2485,134 @@ function handleAnalyzeGoal(message) {
 }
 
 chrome.tabs.onRemoved?.addListener((tabId) => {
+  invalidateAsr(tabId);
   goalSnapshots.delete(tabId);
   goalActiveRequests.delete(tabId);
   goalFetchGenerations.delete(tabId);
 });
 
 // Goal jumps never use the legacy 'any Bilibili tab' fallback.
+function videoKeyFromUrl(value) {
+  try {
+    const url = new URL(value), bvid = url.pathname.match(/^\/video\/(BV[A-Za-z0-9]{10})(?:\/|$)/)?.[1];
+    if (url.hostname !== 'www.bilibili.com' || !bvid) return null;
+    const page = Number(url.searchParams.get('p')) || 1;
+    return Number.isSafeInteger(page) && page > 0 ? `${bvid}@p${page}` : null;
+  } catch { return null; }
+}
 async function handleGoalSeek({ tabId, identity, seconds }) {
-  const snapshot = goalSnapshots.get(tabId);
-  if (!snapshot || !GoalNavigator.sameIdentity(GoalNavigator.identity(snapshot), identity) ||
-      !Number.isFinite(seconds) || !snapshot.cues.some(c => c.start === seconds) ||
-      !await goalTabMatches(tabId, snapshot.video)) return { success: false, error: 'STALE_VIDEO' };
-  const viewResponse = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(snapshot.video.bvid)}`,
-    { credentials: 'include', cache: 'no-store' });
-  const view = await viewResponse.json();
-  if (!viewResponse.ok || view.code !== 0 ||
-      String(view.data?.pages?.[snapshot.video.page - 1]?.cid) !== snapshot.video.cid ||
-      goalSnapshots.get(tabId) !== snapshot || !await goalTabMatches(tabId, snapshot.video)) {
-    return { success: false, error: 'STALE_VIDEO' };
+  const reject = (error, stage) => ({ success:false, error, diagnostics:{stage} });
+  if (!Number.isInteger(tabId) || !identity) return reject('SEEK_INVALID_REQUEST','request');
+  let tab;
+  try { tab = await chrome.tabs.get(tabId); } catch { return reject('SEEK_TAB_UNAVAILABLE','tab'); }
+  if (videoKeyFromUrl(tab.url) !== `${identity.bvid}@p${identity.page}`) return reject('SEEK_VIDEO_MISMATCH','tab_identity');
+  let snapshot = goalSnapshots.get(tabId);
+  if (!snapshot) return reject('SEEK_SNAPSHOT_UNAVAILABLE','snapshot');
+  if (!GoalNavigator.sameIdentity(GoalNavigator.identity(snapshot), identity)) return reject('SEEK_SNAPSHOT_MISMATCH','snapshot');
+  if (!Number.isFinite(seconds) || !snapshot.cues.some(c => c.start === seconds)) return reject('SEEK_INVALID_EVIDENCE','cue');
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
+  let view;
+  try {
+    const response = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(snapshot.video.bvid)}`,
+      { credentials:'include',cache:'no-store',signal:controller.signal });
+    if (!response.ok) return reject('SEEK_NETWORK_ERROR','cid_http');
+    view = await response.json();
+  } catch { return reject('SEEK_NETWORK_ERROR','cid_fetch'); }
+  finally { clearTimeout(timer); }
+  if (view.code !== 0 || !view.data?.pages?.[snapshot.video.page-1]?.cid) return reject('SEEK_VIDEO_INFO_ERROR','cid_payload');
+  if (String(view.data.pages[snapshot.video.page-1].cid) !== snapshot.video.cid) return reject('SEEK_CID_MISMATCH','cid');
+  if (goalSnapshots.get(tabId) !== snapshot || !await goalTabMatches(tabId,snapshot.video)) return reject('SEEK_VIDEO_MISMATCH','pre_send');
+  let result;
+  try { result = await chrome.tabs.sendMessage(tabId,{action:'goalSeek',bvid:snapshot.video.bvid,page:snapshot.video.page,cid:snapshot.video.cid,seconds}); }
+  catch { return reject('SEEK_CONTENT_UNAVAILABLE','content_channel'); }
+  if (goalSnapshots.get(tabId) !== snapshot || !await goalTabMatches(tabId,snapshot.video)) return reject('SEEK_VIDEO_MISMATCH','post_send');
+  return result?.success ? {success:true,diagnostics:{stage:'completed'}} : reject(result?.error || 'SEEK_PLAYER_FAILED','content');
+}
+
+// Only this explicit, staged UI workflow may invoke Fun-ASR.
+const optionalAsrSessions = new Map();
+function invalidateAsr(tabId) {
+  for (const [token, session] of optionalAsrSessions) if (session.tabId === tabId) optionalAsrSessions.delete(token);
+}
+function asrSnapshotResult(snapshot) {
+  const transcript = snapshot.cues.map(c => ({ text: c.text, start: c.start, duration: c.end - c.start, language: snapshot.video.language }));
+  const stamp = seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+  return { success: true, video: snapshot.video, evidenceCues: snapshot.cues, transcript,
+    transcriptText: transcript.map(c => c.text).join(' '),
+    transcriptTextTimestamped: transcript.map(c => `[${stamp(c.start)}] ${c.text}`).join('\n'),
+    language: snapshot.video.language, sourceType: 'asr', source: 'asr', sourceLabel: 'ASR 转写',
+    provider: 'aliyun-fun-asr', rewritten: false, snapshot };
+}
+async function handleOptionalAsr(message) {
+  if (message.action === 'prepareAsr') {
+    if ([...optionalAsrSessions.values()].some(s => s.tabId === message.tabId && s.stage === 'running')) {
+      return { success: false, error: 'ASR_IN_PROGRESS', message: '此视频已有正在进行的转写，请等待完成，避免重复消耗额度。' };
+    }
+    if (!Number.isInteger(message.tabId) || !Number.isSafeInteger(message.page) || message.page < 1 ||
+        !await goalTabMatches(message.tabId, message)) return { success: false, error: 'STALE_VIDEO' };
+    const result = await handleFetchTranscript(message.bvid, '', message.page);
+    if (result.success) return { success: false, error: 'SUBTITLES_AVAILABLE', message: '已发现 B站字幕，请刷新字幕，无需转写。' };
+    if (result.error !== 'NO_TRANSCRIPT') return result;
+    if (!await goalTabMatches(message.tabId, result.video)) return { success: false, error: 'STALE_VIDEO' };
+    invalidateAsr(message.tabId);
+    for (const [key, session] of optionalAsrSessions) if (Date.now() > session.expires) optionalAsrSessions.delete(key);
+    const token = crypto.randomUUID();
+    optionalAsrSessions.set(token, { tabId: message.tabId, video: result.video, stage: 'consent', expires: Date.now() + 600000 });
+    return { success: true, token };
   }
-  const response = await chrome.tabs.sendMessage(tabId, {
-    action: 'goalSeek', bvid: snapshot.video.bvid, page: snapshot.video.page,
-    cid: snapshot.video.cid, seconds,
-  });
-  if (goalSnapshots.get(tabId) !== snapshot || !await goalTabMatches(tabId, snapshot.video)) return { success: false, error: 'STALE_VIDEO' };
-  return response?.success ? { success: true } : { success: false, error: response?.error || 'STALE_VIDEO' };
+  const session = optionalAsrSessions.get(message.token);
+  if (!session || Date.now() > session.expires || !await goalTabMatches(session.tabId, session.video)) return { success: false, error: 'STALE_VIDEO' };
+  if (message.action === 'cancelAsr') { optionalAsrSessions.delete(message.token); return { success: true }; }
+  if (message.action === 'confirmAsrDisclosure' && session.stage === 'consent') {
+    session.stage = 'ready';
+    return { success: true, hasKey: !!(await getSettings()).asrApiKey };
+  }
+  if (message.action === 'saveAsrKey' && session.stage === 'ready') {
+    const key = typeof message.key === 'string' ? message.key.trim() : '';
+    if (!key || key.length > 512 || /\s/.test(key)) return { success: false, error: 'INVALID_ASR_KEY' };
+    const settings = await getSettings();
+    await chrome.storage.local.set({ [YTD_SETTINGS.STORAGE_KEY]: { ...settings, asrApiKey: key } });
+    if ((await getSettings()).asrApiKey !== key) return { success: false, error: 'ASR_KEY_SAVE_FAILED' };
+    return { success: true, hasKey: true };
+  }
+  if (message.action !== 'startAsr') return { success: false, error: 'ASR_CONFIRMATION_REQUIRED' };
+  if (session.promise) return session.promise;
+  if (session.stage !== 'ready') return { success: false, error: 'ASR_CONFIRMATION_REQUIRED' };
+  session.stage = 'running'; // Consume before the first await: repeated clicks cannot launch another task.
+  session.promise = (async () => {
+    try {
+      const settings = await getSettings();
+      if (!settings.asrApiKey) return { success: false, error: 'NO_ASR_KEY', message: '请先保存百炼 API Key，再点击开始转写。' };
+      // Recheck live CID before any audio download/upload/costly operation.
+      const response = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(session.video.bvid)}`, { credentials: 'include', cache: 'no-store' });
+      const view = await response.json();
+      if (!response.ok || view.code !== 0 || String(view.data?.pages?.[session.video.page - 1]?.cid) !== String(session.video.cid) ||
+          optionalAsrSessions.get(message.token) !== session || !await goalTabMatches(session.tabId, session.video)) return { success: false, error: 'STALE_VIDEO' };
+      const result = bdWithAsrMetadata(await transcribeWithBailian(session.video.bvid, session.video.cid, settings.asrApiKey));
+      const snapshot = await GoalTranscriptIndex.createSnapshot({ video: session.video, transcript: result.transcript,
+        sourceType: 'asr', provider: 'aliyun-fun-asr', language: result.language });
+      if (optionalAsrSessions.get(message.token) !== session || !await goalTabMatches(session.tabId, session.video)) return { success: false, error: 'STALE_VIDEO' };
+      goalSnapshots.set(session.tabId, snapshot);
+      goalActiveRequests.delete(session.tabId);
+      const publicResult = asrSnapshotResult(snapshot);
+      const videoId = `${session.video.bvid}@p${session.video.page}`;
+      let cacheSaved = true;
+      try { await chrome.storage.local.set({ [`digest_${videoId}`]: {
+        schemaVersion: 5, videoId, transcript: publicResult.transcript, transcriptText: publicResult.transcriptText,
+        transcriptTimestamped: publicResult.transcriptTextTimestamped, transcriptLanguage: snapshot.video.language,
+        transcriptSourceType: 'asr', transcriptSource: 'asr', transcriptSourceLabel: 'ASR 转写', transcriptProvider: 'aliyun-fun-asr',
+        asrSnapshot: snapshot, analysis: null, timestamp: Date.now(),
+      } }); } catch { cacheSaved = false; }
+      return { ...publicResult, success: true, cacheSaved,
+        cacheWarning: cacheSaved ? null : '转写已完成，但缓存保存失败。当前字幕仍可使用，请勿因此重复转写。' };
+    } catch (failure) {
+      // Do not echo provider errors, signed audio URLs, or credentials.
+      const reason = /超时/.test(failure.message) ? '转写等待超时。'
+        : /音轨|音频上传/.test(failure.message) ? '音轨下载或上传失败。'
+        : /空转写|cue|finite/.test(failure.message) ? '转写结果为空或时间戳无效。'
+        : '百炼转写失败，请检查 Key、额度、网络及服务权限。';
+      return { success: false, error: 'ASR_FAILED', message: reason + '不会自动重试；如需再次转写，请重新确认。' };
+    } finally { session.stage = 'finished'; }
+  })();
+  return session.promise;
 }

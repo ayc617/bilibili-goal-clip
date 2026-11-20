@@ -18,7 +18,7 @@
   function safeSearchUrl(keyword) {
     return `https://search.bilibili.com/all?keyword=${encodeURIComponent(String(keyword || ''))}`;
   }
-  function mount({ document: doc, onSubmit, onClear, onSettings, onSeek, getChapters }) {
+  function mount({ document: doc, onSubmit, onClear, onSettings, onSeek, getChapters, onDraft, onUi }) {
     const byId = id => doc.getElementById(id);
     const input = byId('goalInput');
     const form = byId('goalForm');
@@ -26,6 +26,9 @@
     let composing = false;
     let busy = false;
     let lastGoalRendered;
+    let lastContextKey;
+    let applyingUi = false;
+    let savedExpanded = [];
     const node = (tag, className, text) => {
       const element = doc.createElement(tag);
       if (className) element.className = className;
@@ -39,6 +42,7 @@
       input.setAttribute('aria-invalid', 'false');
       byId('goalClear').disabled = busy || !input.value;
       growInput();
+      onDraft?.(input.value);
     });
     input.addEventListener('compositionstart', () => { composing = true; });
     input.addEventListener('compositionend', () => { composing = false; });
@@ -64,6 +68,20 @@
     });
     byId('goalSettings').addEventListener('click', () => onSettings());
 
+    const disclosures = () => [...doc.querySelectorAll('[data-panel="goal"] details')];
+    const disclosureKey = detail => detail.id || detail.dataset.goalDisclosure;
+    doc.addEventListener?.('toggle', event => {
+      if (applyingUi || !event.target?.matches?.('[data-panel="goal"] details')) return;
+      savedExpanded = disclosures().filter(detail => detail.open).map(disclosureKey).filter(Boolean);
+      onUi?.({ expanded: savedExpanded });
+    }, true);
+    function restoreDisclosures(expanded) {
+      applyingUi = true;
+      savedExpanded = Array.isArray(expanded) ? expanded : savedExpanded;
+      disclosures().forEach(detail => { detail.open = savedExpanded.includes(disclosureKey(detail)); });
+      applyingUi = false;
+    }
+
     function seekButton(segment, label) {
       const button = node('button', 'enhance-btn goal-seek', label || `跳转并定位字幕 · ${formatTime(segment.start)}–${formatTime(segment.end)}`);
       button.type = 'button';
@@ -82,6 +100,7 @@
       article.append(node('p', 'goal-reason', local ? '按词法相关性检索；尚未判断其在学习路径中的作用。' : segment.reason || ''));
       article.append(seekButton(segment));
       const details = node('details', 'goal-disclosure');
+      details.dataset.goalDisclosure = segment.segmentId;
       details.append(node('summary', '', '查看原始字幕证据'));
       details.append(node('blockquote', 'goal-evidence', segment.text || ''));
       if (Array.isArray(segment.occurrences) && segment.occurrences.length > 1) {
@@ -103,8 +122,11 @@
         ['缓存命中', bool(diagnostics.cacheHit)], ['发生模型请求', bool(diagnostics.modelRequested)],
         ['输入 Token', actualNumber(diagnostics.inputTokens ?? usage.prompt_tokens)],
         ['输出 Token', actualNumber(diagnostics.outputTokens ?? usage.completion_tokens)],
+        ['配置读取成功', bool(diagnostics.configRead)],
+        ['后台检测到 Key', bool(diagnostics.keyPresent)],
       ];
       if (diagnostics.errorCode) values.push(['错误类型', diagnostics.errorCode]);
+      if (diagnostics.seekStage) values.push(['跳转诊断层', diagnostics.seekStage]);
       const dl = node('dl', 'goal-debug-list');
       values.forEach(([label, value]) => dl.append(node('dt', '', label), node('dd', '', value)));
       replace('goalDebug', [dl, paragraph('Token 仅显示模型实际返回的 usage；未知不会估算。调试信息仅保留当前页面状态。')]);
@@ -129,7 +151,9 @@
     }
     function render(state = {}) {
       busy = state.phase === 'loading';
-      if (typeof state.goal === 'string' && state.goal !== lastGoalRendered) input.value = state.goal;
+      if (state.contextKey !== lastContextKey) savedExpanded = [];
+      if (typeof state.goal === 'string' && (state.goal !== lastGoalRendered || state.contextKey !== lastContextKey)) input.value = state.goal;
+      lastContextKey = state.contextKey;
       if (typeof state.goal === 'string') lastGoalRendered = state.goal;
       input.disabled = busy;
       form.setAttribute('aria-busy', String(busy));
@@ -138,17 +162,18 @@
       byId('goalClear').disabled = busy || !input.value;
       byId('goalSubmit').textContent = busy ? '正在生成…' : state.phase === 'error' ? '重新尝试' : '生成观看路径';
       byId('goalVideoTitle').textContent = state.title || '当前视频名称暂不可用';
-      byId('goalStatus').textContent = state.message || (busy ? '正在准备字幕证据并分析，请稍候。' : '');
+      const failureCode = state.phase === 'error' ? state.diagnostics?.errorCode : null;
+      byId('goalStatus').textContent = `${state.message || (busy ? '正在准备字幕证据并分析，请稍候。' : '')}${failureCode ? `（错误代码：${failureCode}）` : ''}`;
       byId('goalStatus').dataset.tone = state.phase === 'error' ? 'error' : 'neutral';
-      byId('goalKeyNotice').hidden = state.hasKey !== false;
+      byId('goalKeyNotice').hidden = state.phase === 'ai' || state.hasKey !== false;
       const ai = state.phase === 'ai' && state.response?.result;
       const results = ai ? orderedSegments(state.response) : Array.isArray(state.localResults) ? state.localResults : [];
       const titles = new Map((ai ? state.response.result.subgoals : []).map(g => [g.id, g.title]));
-      byId('goalPathHeading').textContent = ai ? '推荐观看路径' : state.phase === 'local' || results.length ? '关键词相关片段' : '推荐观看路径';
+      byId('goalPathHeading').textContent = ai ? 'AI 观看路径' : state.phase === 'error' ? 'AI 分析失败' : state.phase === 'local' ? '本地关键词检索' : results.length ? '本地关键词检索（AI 尚未完成）' : '推荐观看路径';
       const scope = state.response?.scope;
       byId('goalScope').textContent = ai
         ? `${scope?.allCuesIncluded ? '已提供全部字幕作为候选证据。' : '仅基于部分字幕候选证据。'}未找到支持证据不代表完整视频没有相关内容。`
-        : results.length ? '以下按关键词相关性排列，不是 AI 生成的学习顺序。' : '';
+        : results.length ? `${state.phase === 'error' ? 'AI 分析未成功，以下仅保留本地检索供参考。' : ''}以下按关键词相关性排列，不是 AI 推荐或观看顺序。` : '';
       if (results.length) replace('goalPath', results.map((segment, i) => card(segment, i + 1, titles, !ai)));
       else replace('goalPath', [node('p', 'goal-empty', busy ? '结果将在分析完成后显示。' : ['ai', 'local'].includes(state.phase) ? '未找到相关片段。可以换用更具体的术语或缩小目标；这不表示视频一定没有讨论。' : '输入目标后，相关片段会显示在这里。')]);
       byId('goalCoverageSection').hidden = !ai;
@@ -179,6 +204,7 @@
         const cached = getChapters();
         renderStructure(Array.isArray(cached) ? cached : cached?.chapters, cached?.duration);
       }
+      restoreDisclosures(state.ui?.expanded);
       growInput();
     }
     function highlight(snapshot, segments = []) {

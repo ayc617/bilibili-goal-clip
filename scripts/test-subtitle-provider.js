@@ -207,7 +207,7 @@ async function runScenario(name, route, asrKey = "") {
   assert.equal(webAi.asrCalls, 0);
 
   const asr = await runScenario(
-    "both Bilibili providers empty -> ASR",
+    "both Bilibili providers empty -> no automatic ASR even with key",
     (url) => {
       if (url.includes("/x/player/wbi/v2")) {
         return jsonResponse({
@@ -222,8 +222,8 @@ async function runScenario(name, route, asrKey = "") {
     },
     "configured",
   );
-  assert.equal(asr.result.sourceType, "asr");
-  assert.equal(asr.asrCalls, 1);
+  assert.equal(asr.result.error, "NO_TRANSCRIPT");
+  assert.equal(asr.asrCalls, 0);
 
   const noAsr = await runScenario(
     "both empty + ASR not configured",

@@ -151,3 +151,32 @@ test('Goal seek uses registered evidence, explicit tab and live CID without any 
   assert.equal(jumps.length, 1);
   assert.equal(h.aiCalls().length, 0);
 });
+
+test('ordinary same-video events preserve registered snapshot and network rejection is distinct from CID mismatch', async () => {
+  const h = await harness();
+  const target = {action:'goalSeek',tabId:7,identity:h.goalMessage.expectedIdentity,seconds:1.125};
+  h.context.chrome.tabs.sendMessage = async () => ({success:true});
+  h.events.updated(7,{status:'loading'});
+  h.events.updated(7,{url:'https://www.bilibili.com/video/BV1234567890?share_source=test'});
+  assert.equal((await h.send(target)).success,true);
+  const original=h.context.fetch;
+  h.context.fetch=async url=>{if(url.includes('/x/web-interface/view'))throw Error('network unavailable');return original(url)};
+  let rejected=await h.send(target);
+  assert.equal(rejected.error,'SEEK_NETWORK_ERROR');assert.equal(rejected.diagnostics.stage,'cid_fetch');
+  h.context.fetch=async url=>url.includes('/x/web-interface/view')?{ok:true,json:async()=>({code:0,data:{pages:[{cid:99}]}})}:original(url);
+  rejected=await h.send(target);assert.equal(rejected.error,'SEEK_CID_MISMATCH');assert.equal(rejected.diagnostics.stage,'cid');
+});
+
+test('Background reads configured key but actual HTTP 401 returns explicit authentication failure once', async () => {
+  const h=await harness();
+  const config=await h.send({action:'checkConfig'});
+  assert.equal(config.hasAiKey,true);assert.equal('aiApiKey' in config,false);
+  const original=h.context.fetch;let posts=0;
+  h.context.fetch=async(url,options)=>{
+    if(url==='https://api.deepseek.com/chat/completions'){posts++;return{ok:false,status:401,json:async()=>({error:{message:'Unauthorized'}})}}
+    return original(url,options);
+  };
+  const result=await h.send(h.goalMessage);
+  assert.equal(result.error,'UNAUTHORIZED');assert.equal(result.success,false);
+  assert.equal(result.diagnostics.modelRequested,true);assert.equal(posts,1);
+});

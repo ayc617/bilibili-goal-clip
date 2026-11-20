@@ -1437,3 +1437,27 @@ body {
 @media (prefers-reduced-motion: reduce) {
   [data-panel="goal"], [data-panel="goal"] *, .transcript-entry.goal-recommended { animation: none; transition: none; scroll-behavior: auto; }
 }
+
+/* Optional ASR is disclosed at the no-subtitle entry, never in ordinary settings. */
+#generateSubtitlesBtn { margin-top: 12px; }
+.asr-dialog {
+  width: min(420px, calc(100vw - 28px)); max-height: calc(100vh - 32px);
+  margin: auto; padding: 20px; overflow-y: auto;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border-heavy);
+  border-radius: var(--r-md); box-shadow: var(--shadow-lg); font-family: var(--font-body);
+}
+.asr-dialog::backdrop { background: rgba(24, 25, 28, .45); }
+.asr-dialog [hidden] { display: none !important; }
+.asr-dialog-heading { display: flex; gap: 12px; align-items: baseline; justify-content: space-between; }
+.asr-dialog h2 { font-size: 17px; line-height: 1.5; }
+.asr-dialog p, .asr-dialog label, .asr-dialog a { font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
+.asr-dialog p { margin: 12px 0; }
+.asr-dialog label { display: block; margin-top: 14px; font-weight: 600; }
+.asr-dialog input { width: 100%; min-height: 38px; padding: 8px; border: 1px solid var(--border-heavy); border-radius: var(--r-sm); background: var(--surface); color: var(--text); }
+.asr-dialog a { display: inline-block; color: var(--text); text-decoration: underline; margin: 8px 0; }
+.asr-dialog button { min-height: 36px; cursor: pointer; }
+.asr-dialog button:disabled { cursor: default; opacity: .6; }
+.asr-dialog :is(button, input, a):focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+.asr-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+#asrSaveKey { display: block; margin: 8px 0 14px; }
+#asrStatus { min-height: 24px; }

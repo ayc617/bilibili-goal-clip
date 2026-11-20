@@ -72,6 +72,7 @@
             暂时无法处理这个视频。
           </div>
           <button class="error-btn" id="errorBtn">重新尝试</button>
+          <button class="enhance-btn" id="generateSubtitlesBtn" type="button" hidden>生成字幕（可选）</button>
         </div>
       </div>
 
@@ -261,12 +262,39 @@
       跟随播放位置
     </button>
 
+    <dialog id="asrDialog" class="asr-dialog" aria-labelledby="asrDialogTitle" aria-describedby="asrConsentText">
+      <div class="asr-dialog-heading">
+        <h2 id="asrDialogTitle">生成字幕（可选）</h2>
+        <button id="asrClose" class="enhance-btn" type="button" aria-label="关闭转写窗口">关闭</button>
+      </div>
+      <p id="asrConsentText">音频将下载并上传至阿里云百炼处理。转写可能消耗你自己的 API 额度并产生费用。只有再次点击“开始转写”后才会下载、上传或调用 Fun-ASR。</p>
+      <div id="asrConsentActions" class="asr-actions">
+        <button id="asrCancel" class="enhance-btn" type="button">取消</button>
+        <button id="asrContinue" class="enhance-btn" type="button">了解并继续</button>
+      </div>
+      <div id="asrConfiguration" hidden>
+        <p id="asrKeyStatus"></p>
+        <button id="asrChangeKey" class="enhance-btn" type="button">修改或更换百炼 Key</button>
+        <form id="asrKeyForm" novalidate hidden>
+          <label for="asrKeyInput">百炼 API Key</label>
+          <input id="asrKeyInput" type="password" autocomplete="off" spellcheck="false" maxlength="512" aria-describedby="asrKeyHelp asrStatus" />
+          <p id="asrKeyHelp">Key 保存在当前扩展本地存储，不会显示已有值。保存 Key 不会开始转写。</p>
+          <a href="https://bailian.console.aliyun.com/?apiKey=1" target="_blank" rel="noopener noreferrer">获取百炼 API Key</a>
+          <button id="asrSaveKey" class="enhance-btn" type="submit">保存百炼 Key</button>
+        </form>
+        <button id="asrStart" class="enhance-btn" type="button" hidden>开始转写</button>
+      </div>
+      <p id="asrStatus" role="status" aria-live="polite"></p>
+    </dialog>
+
     <script src="settings.js"></script>
     <script src="goal/transcript-index.js"></script>
     <script src="goal/navigator.js"></script>
     <script src="goal/cache.js"></script>
+    <script src="goal/session-state.js"></script>
     <script src="goal/controller.js"></script>
     <script src="goal/view.js"></script>
+    <script src="goal/asr-view.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

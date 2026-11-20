@@ -9,7 +9,7 @@ const YTD_OPTIONS = (() => {
       languageGroupLabel: "Interface language",
       heading: "Bring your own API keys",
       lede:
-        "Keys stay in this Chrome profile. Audio is sent to Alibaba Bailian for ASR, while transcripts and context are sent to DeepSeek for AI features.",
+        "Keys stay in this Chrome profile. Only when you explicitly start optional transcription is audio sent to Alibaba Bailian. Transcripts and context are sent to DeepSeek for AI features.",
       transcriptProvider: "Transcript provider",
       supadataApiKeyLabel: "Supadata API key",
       supadataHelp: "Used to fetch timestamped YouTube subtitles. ",
@@ -80,7 +80,7 @@ const YTD_OPTIONS = (() => {
       languageGroupLabel: "界面语言",
       heading: "Bilibili Digest 设置",
       lede:
-        "密钥仅保存在当前 Chrome 个人资料中。音频会发送给阿里云百炼进行语音识别，字幕和视频上下文会发送给 DeepSeek 生成概览等内容。",
+        "密钥仅保存在当前 Chrome 个人资料中。仅主动开始可选转写时，音频才会发送给阿里云百炼；字幕和视频上下文会发送给 DeepSeek 生成概览等内容。",
       transcriptProvider: "字幕服务",
       supadataApiKeyLabel: "Supadata API 密钥",
       supadataHelp: "用于获取带时间戳的 YouTube 字幕。",
@@ -381,7 +381,6 @@ const YTD_OPTIONS = (() => {
     );
     const form = doc.getElementById("settingsForm");
     const aiApiKeyInput = doc.getElementById("aiApiKey");
-    const asrApiKeyInput = doc.getElementById("asrApiKey");
     const customizationPrompt = doc.getElementById("customizationPrompt");
     const copyCustomizationPromptBtn = doc.getElementById(
       "copyCustomizationPromptBtn",
@@ -453,7 +452,6 @@ const YTD_OPTIONS = (() => {
         const settings = migration.settings;
 
         aiApiKeyInput.value = settings.aiApiKey;
-        asrApiKeyInput.value = settings.asrApiKey;
         if (migration.migrated) {
           await storage.set({ [settingsApi.STORAGE_KEY]: settings });
           setStatus(saveStatus, "migrationWarning");
@@ -476,17 +474,18 @@ const YTD_OPTIONS = (() => {
       event.preventDefault();
       setStatus(saveStatus, "saving");
 
-      const settings = settingsApi.normalize({
-        aiApiKey: aiApiKeyInput.value,
-        asrApiKey: asrApiKeyInput.value,
-      });
-
-      if (!settings.aiApiKey && !settings.asrApiKey) {
-        setStatus(saveStatus, "addDeepseekKey");
-        return;
-      }
-
       try {
+        // Bailian is configured only at the optional transcription entry.
+        // Read the latest value here so editing DeepSeek never clears an existing ASR key.
+        const stored = await storage.get(settingsApi.STORAGE_KEY);
+        const settings = settingsApi.normalize({
+          ...stored[settingsApi.STORAGE_KEY],
+          aiApiKey: aiApiKeyInput.value,
+        });
+        if (!settings.aiApiKey) {
+          setStatus(saveStatus, "addDeepseekKey");
+          return;
+        }
         await persistAndVerifySettings(
           storage,
           settingsApi.STORAGE_KEY,

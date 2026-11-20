@@ -38,6 +38,9 @@ let errorAction = null;
 let goalController = null;
 let goalView = null;
 let panelCheckGeneration = 0;
+let asrView = null;
+let currentAsrSnapshot = null;
+let asrUiGeneration = 0;
 
 // --- Translation state ---
 // The public transcript control intentionally supports only the original
@@ -244,6 +247,7 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
 
 document.addEventListener("DOMContentLoaded", async () => {
   setupGoalPanel();
+  setupOptionalAsr();
   setupEventListeners();
   await evictOldCacheEntries(20);
 
@@ -266,7 +270,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.action === "bilibiliNavigation") {
     if (sender.tab?.id && sender.tab.id !== youtubeTabId) return false;
-    handleFrontTabUrl(message.url);
+    // DOM collection links may lag the player/address bar. Canonical tab URL decides identity.
+    const targetTabId = youtubeTabId;
+    if (targetTabId != null) chrome.tabs.get(targetTabId).then(tab => {
+      if (targetTabId !== youtubeTabId) return;
+      handleFrontTabUrl(tab.url || tab.pendingUrl || '', targetTabId);
+    }).catch(() => {});
     sendResponse({ success: true });
   }
   if (message.action === "transcriptProgress") {
@@ -328,50 +337,45 @@ function panelIsShowingResults() {
  * Reacts to the URL now in front of the panel: close on non-YouTube,
  * refresh the digest when the video changed.
  */
-function handleFrontTabUrl(url) {
-  goalController?.setContext(null);
-  if (!/^https:\/\/www\.bilibili\.com\/video\//.test(url || "")) {
-    // Panel is a YouTube-only tool — remove itself from non-YouTube tabs.
-    window.close();
-    return;
-  }
-
-  const newVideoId = extractVideoId(url);
-  // Refresh when the video changed, or when we're not currently showing
-  // results (e.g. user went home, then clicked back into the same video).
-  scheduleDigestRefresh();
-}
-
-// Fires when a tab's URL changes — including YouTube's no-reload navigation.
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (tabId === youtubeTabId && (changeInfo.url || changeInfo.status === "loading")) {
-    panelCheckGeneration++;
-    digestGeneration++;
-    translationGeneration++;
-    goalController?.setContext(null);
-    scheduleDigestRefresh();
-  }
-  if (!changeInfo.url || !tab.active) return;
-  if (panelWindowId !== null && tab.windowId !== panelWindowId) return;
-  handleFrontTabUrl(changeInfo.url);
-});
-
-// Fires when a different tab comes to the front — switching tabs, or a new
-// tab being opened (including ones opened by clicking links in other apps).
-chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
-  if (panelWindowId !== null && windowId !== panelWindowId) return;
+function suspendGoalContext() {
+  asrUiGeneration++;
+  asrView?.close();
+  asrView?.offer(false);
   panelCheckGeneration++;
   digestGeneration++;
   translationGeneration++;
   goalController?.setContext(null);
+}
+
+function handleFrontTabUrl(url, tabId = youtubeTabId) {
+  // Window restoration can temporarily have no committed URL; that is not navigation.
+  if (!url) return;
+  const newVideoId = extractVideoId(url);
+  if (newVideoId && newVideoId === currentVideoId && tabId === youtubeTabId) {
+    if (!panelIsShowingResults()) scheduleDigestRefresh();
+    return;
+  }
+  suspendGoalContext();
+  if (!newVideoId) {
+    Promise.resolve(goalController?.flush()).finally(() => window.close());
+    return;
+  }
+  scheduleDigestRefresh();
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo.url || !tab?.active) return;
+  if (panelWindowId !== null && tab.windowId !== panelWindowId) return;
+  handleFrontTabUrl(changeInfo.url, tabId);
+});
+
+chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  if (panelWindowId !== null && windowId !== panelWindowId) return;
+  if (tabId !== youtubeTabId) suspendGoalContext();
   try {
     const tab = await chrome.tabs.get(tabId);
-    // Brand-new tabs may not have committed their URL yet — fall back to
-    // the pending one so we judge where the tab is actually going.
-    handleFrontTabUrl(tab.url || tab.pendingUrl || "");
-  } catch (e) {
-    // Tab closed before we could read it — nothing to do.
-  }
+    handleFrontTabUrl(tab.url || tab.pendingUrl || '', tabId);
+  } catch { /* A transient activation or a closed tab is not a new video identity. */ }
 });
 
 function setupEventListeners() {
@@ -480,16 +484,16 @@ async function checkCurrentTab() {
     debugLog("[YouTube Digest Panel] Found tab:", tab?.id, tab?.url);
 
     if (!tab?.url) {
-      goalController?.setContext(null);
-      showState("welcome");
+      // Minimize/restore may briefly make the active-tab query empty.
+      if (youtubeTabId == null) showState("welcome");
       return;
     }
 
     // Store the tab ID for reliable messaging later
     if (checkGeneration !== panelCheckGeneration) return;
-    youtubeTabId = tab.id;
-
     const videoId = extractVideoId(tab.url);
+    const sameTarget = youtubeTabId === tab.id && currentVideoId === videoId;
+    youtubeTabId = tab.id;
 
     if (videoId) {
       currentVideoUrl = tab.url;
@@ -517,9 +521,15 @@ async function checkCurrentTab() {
 
       if (checkGeneration !== panelCheckGeneration) return;
       if (videoId !== currentVideoId) currentAnalysis = null;
-      goalController?.setContext({ tabId: tab.id, bvid: videoId.split("@p")[0],
+      const goalContextChanged = goalController?.setContext({ tabId: tab.id, bvid: videoId.split("@p")[0],
         page: Number(videoId.split("@p")[1]), title: currentVideoTitle });
-      startDigest(videoId, tab.url);
+      if (sameTarget && currentTranscript) {
+        if (goalContextChanged) await goalController?.restore();
+        return;
+      }
+      await startDigest(videoId, tab.url);
+      if (checkGeneration !== panelCheckGeneration) return;
+      if (currentTranscript && currentVideoId === videoId) await goalController?.restore();
     } else {
       showState("welcome");
     }
@@ -550,6 +560,8 @@ function extractVideoId(url) {
 // ============================================================
 
 async function startDigest(videoId, videoUrl) {
+  asrView?.offer(false);
+  currentAsrSnapshot = null;
   currentTranscriptMode = "original";
   translationGeneration++;
   setTranscriptModeButtons("original");
@@ -576,6 +588,7 @@ async function startDigest(videoId, videoUrl) {
     currentVideoUrl = videoUrl;
     currentAnalysis = cached.analysis || null;
     currentTranscript = cached.transcript;
+    currentAsrSnapshot = cached.asrSnapshot || null;
     currentTranscriptText = cached.transcriptText;
     currentTranscriptTimestamped = cached.transcriptTimestamped;
     currentTranscriptLanguage = cached.transcriptLanguage || null;
@@ -660,6 +673,7 @@ async function startDigest(videoId, videoUrl) {
   if (generation !== digestGeneration || videoId !== currentVideoId) return;
 
   if (!transcriptResult.success) {
+    asrView?.offer(transcriptResult.error === 'NO_TRANSCRIPT');
     const detail = transcriptResult.message || transcriptResult.error;
     const errorTitle =
       transcriptResult.error === "SUBTITLE_AUTH_REQUIRED"
@@ -683,6 +697,7 @@ async function startDigest(videoId, videoUrl) {
   }
 
   currentTranscript = transcriptResult.transcript;
+  currentAsrSnapshot = transcriptResult.sourceType === 'asr' ? transcriptResult.snapshot : null;
   currentTranscriptText = transcriptResult.transcriptText;
   currentTranscriptTimestamped = transcriptResult.transcriptTextTimestamped;
   currentTranscriptLanguage = transcriptResult.language || null;
@@ -1111,6 +1126,7 @@ function showConfigError(configStatus) {
 // ============================================================
 
 function switchTab(tabName) {
+  if (!restoringGoalUi) goalController?.setUi({ selectedTab: tabName, scrollTop: 0 });
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.tab === tabName);
   });
@@ -1484,6 +1500,7 @@ async function saveToCache(videoId) {
 
     const cacheData = {
       schemaVersion: DIGEST_CACHE_SCHEMA_VERSION,
+      asrSnapshot: currentAsrSnapshot,
       videoId,
       analysis: currentAnalysis, // May be null if not yet analyzed
       transcript: currentTranscript,
@@ -2250,13 +2267,15 @@ function setupGoalPanel() {
       if (youtubeTabId !== target.tabId || currentVideoId !== `${target.bvid}@p${target.page}`) return false;
       try {
         const tab = await chrome.tabs.get(target.tabId);
-        return tab.active && (panelWindowId == null || tab.windowId === panelWindowId) &&
+        return youtubeTabId === target.tabId && currentVideoId === `${target.bvid}@p${target.page}` &&
+          tab.active && (panelWindowId == null || tab.windowId === panelWindowId) &&
           extractVideoId(tab.url) === `${target.bvid}@p${target.page}`;
       } catch { return false; }
     },
     seek: payload => chrome.runtime.sendMessage({ action: 'goalSeek', ...payload }),
     onChange: state => {
       goalView?.render(state);
+      if (state.restored && state.ui) restoreGoalUi(state.ui);
       if (state.phase === 'idle') goalView?.renderStructure([], 0);
       const snapshot = goalController?.getSnapshot();
       // Fresh Goal evidence supersedes stale display cache, without triggering AI features.
@@ -2283,6 +2302,8 @@ function setupGoalPanel() {
   });
   goalView = GoalPanelView.mount({ document,
     onSubmit: goal => goalController.submit(goal), onClear: () => goalController.clear(),
+    onDraft: goal => goalController.updateDraft(goal),
+    onUi: ui => goalController.setUi(ui),
     onSettings: () => chrome.runtime.sendMessage({ action: 'openOptions' }),
     onSeek: async segment => {
       if (await goalController.jump(segment)) {
@@ -2295,6 +2316,13 @@ function setupGoalPanel() {
       }
     },
     getChapters: () => ({ chapters: currentAnalysis?.chapters || [], duration: currentVideoDuration }),
+  });
+  document.getElementById('contentArea')?.addEventListener('scroll', () => {
+    if (!restoringGoalUi) goalController.setUi({ scrollTop: document.getElementById('contentArea').scrollTop });
+  }, { passive: true });
+  window.addEventListener('pagehide', () => { goalController.flush(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') goalController.flush();
   });
   document.getElementById('generateOverviewBtn')?.addEventListener('click', async () => {
     const config = await chrome.runtime.sendMessage({ action: 'checkConfig' });
@@ -2321,5 +2349,102 @@ function applyGoalHighlights() {
 }
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  if (tabId === youtubeTabId) { asrUiGeneration++; asrView?.close(); asrView?.offer(false); }
   if (tabId === youtubeTabId) { goalController?.setContext(null); currentVideoId = null; }
 });
+
+function setupOptionalAsr() {
+  let token = null, target = null, preparing = false;
+  const current = async generation => {
+    if (generation !== asrUiGeneration || !target || youtubeTabId !== target.tabId || currentVideoId !== target.videoId) return false;
+    try {
+      const tab = await chrome.tabs.get(target.tabId);
+      return generation === asrUiGeneration && tab.active && extractVideoId(tab.url) === target.videoId;
+    } catch { return false; }
+  };
+  const prepare = async () => {
+    if (preparing || !currentVideoId || !youtubeTabId) return;
+    preparing = true;
+    const generation = ++asrUiGeneration;
+    target = { tabId: youtubeTabId, videoId: currentVideoId, url: currentVideoUrl };
+    try {
+      const response = await chrome.runtime.sendMessage({ action: 'prepareAsr', tabId: target.tabId,
+        bvid: target.videoId.split('@p')[0], page: Number(target.videoId.split('@p')[1]) });
+      if (!await current(generation)) return;
+      if (!response.success) { showError('暂时无法准备转写', response.message || '视频状态变化，请刷新视频后重试。'); return; }
+      token = response.token;
+      asrView.setState({ stage: 'consent', message: '' });
+    } catch {
+      if (await current(generation)) showError('转写准备失败', '请检查网络后手动重试，尚未启动音频处理。');
+    } finally { preparing = false; }
+  };
+  const call = async (action, extra = {}) => {
+    const generation = asrUiGeneration;
+    try {
+      const response = await chrome.runtime.sendMessage({ action, token, ...extra });
+      if (!await current(generation)) return null;
+      if (!response.success) {
+        asrView.setState({ stage: 'error', message: response.message || '操作失败，请关闭后重新打开转写入口。' });
+        return null;
+      }
+      return response;
+    } catch {
+      if (await current(generation)) asrView.setState({ stage: 'error', message: '连接中断或服务未响应。请关闭后手动重新确认；不会自动重试。' });
+      return null;
+    }
+  };
+  asrView = GoalAsrView.mount({ document, onPrepare: prepare,
+    onContinue: async () => {
+      const response = await call('confirmAsrDisclosure');
+      if (response) asrView.setState({ stage: response.hasKey ? 'ready' : 'config', hasKey: response.hasKey });
+    },
+    onSaveKey: async key => {
+      const response = await call('saveAsrKey', { key });
+      if (response) asrView.setState({ stage: 'ready', hasKey: true, message: 'Key 已保存。仅点击“开始转写”后才会处理音频。' });
+    },
+    onStart: async () => {
+      const generation = asrUiGeneration;
+      asrView.setState({ stage: 'running', hasKey: true, message: '正在转写。请保持当前视频打开；关闭窗口不会撤销已发生的服务调用。' });
+      const response = await call('startAsr');
+      if (!response || !await current(generation)) return;
+      currentAsrSnapshot = response.snapshot;
+      currentTranscript = response.transcript;
+      currentTranscriptText = response.transcriptText;
+      currentTranscriptTimestamped = response.transcriptTextTimestamped;
+      currentTranscriptLanguage = response.language;
+      currentTranscriptSourceType = 'asr';
+      currentTranscriptSource = 'asr';
+      currentTranscriptSourceLabel = 'ASR 转写';
+      currentTranscriptProvider = 'aliyun-fun-asr';
+      currentTranscriptRewritten = false;
+      currentAnalysis = null;
+      digestGeneration++;
+      translationGeneration++;
+      currentTranscriptMode = 'original';
+      setTranscriptModeButtons('original');
+      updateTranscriptLanguageModes();
+      renderTranscript();
+      showState('results');
+      loadNotes(target.videoId);
+      setupExplainFeature();
+      asrView.offer(false);
+      asrView.setState({ stage: 'done', hasKey: true,
+        message: response.cacheWarning || '转写成功，字幕已可供浏览及目标导航使用。未调用 Goal 分析。' });
+    },
+  });
+}
+
+let restoringGoalUi = false;
+function restoreGoalUi(ui) {
+  if (restoringGoalUi) return;
+  restoringGoalUi = true;
+  const tabId = youtubeTabId, videoId = currentVideoId;
+  if (['transcript', 'overview', 'notes', 'goal'].includes(ui.selectedTab)) switchTab(ui.selectedTab);
+  requestAnimationFrame(() => {
+    if (youtubeTabId === tabId && currentVideoId === videoId) {
+      const content = document.getElementById('contentArea');
+      if (content && Number.isFinite(ui.scrollTop)) content.scrollTop = Math.max(0, ui.scrollTop);
+    }
+    restoringGoalUi = false;
+  });
+}
