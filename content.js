@@ -131,6 +131,20 @@ if (document.readyState === "loading") {
  * When they send key moments, we highlight them on the progress bar.
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "goalSeek") {
+    const bvid = location.pathname.match(/^\/video\/(BV[A-Za-z0-9]{10})(?:\/|$)/)?.[1];
+    const video = document.querySelector("video");
+    if (bvid !== message.bvid || getActiveBilibiliPart() !== message.page || !video ||
+        !Number.isFinite(message.seconds) || message.seconds < 0 ||
+        (Number.isFinite(video.duration) && message.seconds > video.duration)) {
+      sendResponse({ success: false, error: "STALE_VIDEO" });
+      return false;
+    }
+    video.currentTime = message.seconds;
+    if (video.paused) video.play().catch(() => {});
+    sendResponse({ success: true });
+    return false;
+  }
   debugLog("[YouTube Digest Content] Received message:", message.action, message);
 
   if (message.action === "getVideoInfo") {

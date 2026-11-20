@@ -35,6 +35,9 @@ let currentVideoDuration = 0;
 let isAnalysisLoading = false; // Track if analysis is in progress
 let youtubeTabId = null; // Store the YouTube tab ID for reliable messaging
 let errorAction = null;
+let goalController = null;
+let goalView = null;
+let panelCheckGeneration = 0;
 
 // --- Translation state ---
 // The public transcript control intentionally supports only the original
@@ -170,6 +173,7 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
       oversizedParts.forEach((part, partIndex) => {
         const ratio = text.length ? Math.min(1, consumedChars / text.length) : 0;
         pieces.push({
+          cueIndex: entryIndex,
           text: part,
           start: start + duration * ratio,
           semanticEnd:
@@ -191,6 +195,7 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
     const index = grouped.length;
     const text = normalizeCaptionText(current.text);
     grouped.push({
+      cueIndexes: [...current.cueIndexes],
       id: `segment-${index}-${Math.round(current.start * 1000)}`,
       start: current.start,
       text,
@@ -200,7 +205,8 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
   };
 
   pieces.forEach((piece) => {
-    if (!current) current = { start: piece.start, text: "" };
+    if (!current) current = { start: piece.start, text: "", cueIndexes: new Set() };
+    current.cueIndexes.add(piece.cueIndex);
     current.text = normalizeCaptionText(`${current.text} ${piece.text}`);
     const elapsed = Math.max(0, piece.start - current.start);
     const comfortablySized = current.text.length >= limits.minChars;
@@ -237,17 +243,13 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
 // ============================================================
 
 document.addEventListener("DOMContentLoaded", async () => {
+  setupGoalPanel();
   setupEventListeners();
   await evictOldCacheEntries(20);
 
   const configStatus = await chrome.runtime.sendMessage({
     action: "checkConfig",
   });
-
-  if (!configStatus.hasSupadataKey || !configStatus.hasAiKey) {
-    showConfigError(configStatus);
-    return;
-  }
 
   await checkCurrentTab();
 });
@@ -263,6 +265,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
   }
   if (message.action === "bilibiliNavigation") {
+    if (sender.tab?.id && sender.tab.id !== youtubeTabId) return false;
     handleFrontTabUrl(message.url);
     sendResponse({ success: true });
   }
@@ -326,6 +329,7 @@ function panelIsShowingResults() {
  * refresh the digest when the video changed.
  */
 function handleFrontTabUrl(url) {
+  goalController?.setContext(null);
   if (!/^https:\/\/www\.bilibili\.com\/video\//.test(url || "")) {
     // Panel is a YouTube-only tool — remove itself from non-YouTube tabs.
     window.close();
@@ -335,13 +339,18 @@ function handleFrontTabUrl(url) {
   const newVideoId = extractVideoId(url);
   // Refresh when the video changed, or when we're not currently showing
   // results (e.g. user went home, then clicked back into the same video).
-  if (newVideoId !== currentVideoId || !panelIsShowingResults()) {
-    scheduleDigestRefresh();
-  }
+  scheduleDigestRefresh();
 }
 
 // Fires when a tab's URL changes — including YouTube's no-reload navigation.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tabId === youtubeTabId && (changeInfo.url || changeInfo.status === "loading")) {
+    panelCheckGeneration++;
+    digestGeneration++;
+    translationGeneration++;
+    goalController?.setContext(null);
+    scheduleDigestRefresh();
+  }
   if (!changeInfo.url || !tab.active) return;
   if (panelWindowId !== null && tab.windowId !== panelWindowId) return;
   handleFrontTabUrl(changeInfo.url);
@@ -351,6 +360,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // tab being opened (including ones opened by clicking links in other apps).
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
   if (panelWindowId !== null && windowId !== panelWindowId) return;
+  panelCheckGeneration++;
+  digestGeneration++;
+  translationGeneration++;
+  goalController?.setContext(null);
   try {
     const tab = await chrome.tabs.get(tabId);
     // Brand-new tabs may not have committed their URL yet — fall back to
@@ -435,6 +448,7 @@ function setNotesFilter(showAll) {
 // ============================================================
 
 async function checkCurrentTab() {
+  const checkGeneration = ++panelCheckGeneration;
   try {
     // Try multiple strategies to find the YouTube tab
     let tab = null;
@@ -442,14 +456,14 @@ async function checkCurrentTab() {
     // Strategy 1: Active tab in last focused window
     let tabs = await chrome.tabs.query({
       active: true,
-      lastFocusedWindow: true,
+      ...(panelWindowId == null ? { currentWindow: true } : { windowId: panelWindowId }),
     });
     if (tabs[0]?.url?.includes("bilibili.com/video/")) {
       tab = tabs[0];
     }
 
     // Strategy 2: Any active YouTube tab
-    if (!tab) {
+    if (!tab && panelWindowId == null) {
       tabs = await chrome.tabs.query({
         url: "https://www.bilibili.com/video/*",
         active: true,
@@ -458,7 +472,7 @@ async function checkCurrentTab() {
     }
 
     // Strategy 3: Any YouTube tab (last resort)
-    if (!tab) {
+    if (!tab && panelWindowId == null) {
       tabs = await chrome.tabs.query({ url: "https://www.bilibili.com/video/*" });
       if (tabs[0]) tab = tabs[0];
     }
@@ -466,11 +480,13 @@ async function checkCurrentTab() {
     debugLog("[YouTube Digest Panel] Found tab:", tab?.id, tab?.url);
 
     if (!tab?.url) {
+      goalController?.setContext(null);
       showState("welcome");
       return;
     }
 
     // Store the tab ID for reliable messaging later
+    if (checkGeneration !== panelCheckGeneration) return;
     youtubeTabId = tab.id;
 
     const videoId = extractVideoId(tab.url);
@@ -480,10 +496,9 @@ async function checkCurrentTab() {
 
       try {
         // Route through background script for reliable message passing
-        const result = await chrome.runtime.sendMessage({
-          action: "relayToContent",
-          payload: { action: "getVideoInfo" },
-        });
+        const response = await chrome.tabs.sendMessage(tab.id, { action: "getVideoInfo" });
+        const result = { success: true, response };
+        if (checkGeneration !== panelCheckGeneration) return;
         debugLog("[YouTube Digest Panel] getVideoInfo result:", result);
         if (result.success && result.response) {
           currentVideoTitle = result.response.title || "";
@@ -492,6 +507,7 @@ async function checkCurrentTab() {
           currentVideoDuration = result.response.duration || 0;
         }
       } catch (e) {
+        if (checkGeneration !== panelCheckGeneration) return;
         console.error("[YouTube Digest Panel] getVideoInfo error:", e);
         currentVideoTitle = "";
         currentChannelName = "";
@@ -499,6 +515,10 @@ async function checkCurrentTab() {
         currentVideoDuration = 0;
       }
 
+      if (checkGeneration !== panelCheckGeneration) return;
+      if (videoId !== currentVideoId) currentAnalysis = null;
+      goalController?.setContext({ tabId: tab.id, bvid: videoId.split("@p")[0],
+        page: Number(videoId.split("@p")[1]), title: currentVideoTitle });
       startDigest(videoId, tab.url);
     } else {
       showState("welcome");
@@ -530,6 +550,9 @@ function extractVideoId(url) {
 // ============================================================
 
 async function startDigest(videoId, videoUrl) {
+  currentTranscriptMode = "original";
+  translationGeneration++;
+  setTranscriptModeButtons("original");
   const generation = ++digestGeneration;
   // Check if we already have this video loaded in memory
   if (videoId === currentVideoId && currentAnalysis) {
@@ -596,7 +619,7 @@ async function startDigest(videoId, videoUrl) {
 
     // Setup explain feature
     setupExplainFeature();
-    if (currentTranscriptMode !== "original") translateTranscript();
+    applyGoalHighlights();
     return;
   }
 
@@ -625,9 +648,10 @@ async function startDigest(videoId, videoUrl) {
   updateLoading("正在获取字幕", "");
 
   const transcriptResult = await chrome.runtime.sendMessage({
-    action: "fetchTranscript",
-    videoId: videoId.split("@p")[0],
-    pageNumber: Math.max(
+    action: "fetchGoalTranscript",
+    tabId: youtubeTabId,
+    bvid: videoId.split("@p")[0],
+    page: Math.max(
       1,
       Number(String(videoId.split("@p")[1] || "1").replace(/^p/i, "")) || 1,
     ),
@@ -686,7 +710,7 @@ async function startDigest(videoId, videoUrl) {
 
   // Setup explain feature for text selection
   setupExplainFeature();
-  if (currentTranscriptMode !== "original") translateTranscript();
+  applyGoalHighlights();
 
   // Save transcript to cache (without analysis)
   await saveToCache(videoId);
@@ -917,6 +941,7 @@ function renderTranscript() {
   grouped.forEach((group) => {
     const div = document.createElement("div");
     div.className = "transcript-entry";
+    div.dataset.cueIndexes = JSON.stringify(group.cueIndexes);
     div.dataset.seconds = group.start;
 
     const minutes = Math.floor(group.start / 60);
@@ -936,6 +961,7 @@ function renderTranscript() {
 
   // Start tracking video playback for auto-scroll
   startPlaybackTracking();
+  applyGoalHighlights();
 }
 
 function currentCanonicalVideoUrl() {
@@ -1101,9 +1127,7 @@ function switchTab(tabName) {
   }
 
   // Lazy-load LLM analysis when user switches to Overview tab
-  if (tabName === "overview" && !currentAnalysis && !isAnalysisLoading) {
-    triggerAnalysis();
-  }
+  if (tabName === "goal") goalView?.renderStructure(currentAnalysis?.chapters || [], currentVideoDuration);
 }
 
 /**
@@ -1115,6 +1139,9 @@ async function triggerAnalysis() {
     return;
 
   isAnalysisLoading = true;
+  const analysisGeneration = digestGeneration;
+  const analysisVideo = currentVideoId;
+  const analysisTab = youtubeTabId;
 
   // Show loading indicators in the Overview tab
   const chapterList = document.getElementById("chapterList");
@@ -1136,6 +1163,7 @@ async function triggerAnalysis() {
       videoDescription: currentVideoDescription,
       videoDuration: currentVideoDuration,
     });
+    if (analysisGeneration !== digestGeneration || analysisVideo !== currentVideoId || analysisTab !== youtubeTabId) return;
 
     if (!analysisResult.success) {
       if (chapterList)
@@ -1146,17 +1174,19 @@ async function triggerAnalysis() {
 
     currentAnalysis = analysisResult.analysis;
     renderAnalysisResults(currentAnalysis);
+    goalView?.renderStructure(currentAnalysis.chapters || [], currentVideoDuration);
     highlightMomentsOnPage(currentAnalysis.keyMoments);
 
     // Save to cache now that we have analysis
     await saveToCache(currentVideoId);
   } catch (error) {
     console.error("[YouTube Digest Panel] Analysis error:", error);
+    if (analysisGeneration !== digestGeneration || analysisVideo !== currentVideoId || analysisTab !== youtubeTabId) return;
     if (chapterList)
       chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Error: ${escapeHtml(error.message)}</li>`;
   }
 
-  isAnalysisLoading = false;
+  if (analysisGeneration === digestGeneration && analysisVideo === currentVideoId && analysisTab === youtubeTabId) isAnalysisLoading = false;
 }
 
 // ============================================================
@@ -1164,41 +1194,15 @@ async function triggerAnalysis() {
 // ============================================================
 
 async function seekTo(seconds) {
-  debugLog("[YouTube Digest Panel] seekTo called with:", seconds);
-  if (seconds === undefined || seconds === null) {
-    debugLog("[YouTube Digest Panel] seekTo aborted - no seconds value");
-    return;
-  }
-
-  const payload = {
-    action: "seekTo",
-    seconds: Number(seconds),
-  };
-
+  const tabId = youtubeTabId, videoId = currentVideoId;
+  const numeric = Number(seconds);
+  if (!tabId || !videoId || !Number.isFinite(numeric) || numeric < 0) return;
   try {
-    // Try direct messaging to the stored YouTube tab first (fastest/reliable)
-    if (youtubeTabId) {
-      try {
-        await chrome.tabs.sendMessage(youtubeTabId, payload);
-        debugLog("[YouTube Digest Panel] seekTo direct success");
-        return;
-      } catch (directErr) {
-        debugLog(
-          "[YouTube Digest Panel] Direct seekTo failed, falling back to relay:",
-          directErr.message,
-        );
-      }
-    }
-
-    // Fallback: route through background script
-    const result = await chrome.runtime.sendMessage({
-      action: "relayToContent",
-      payload,
-    });
-    debugLog("[YouTube Digest Panel] seekTo relay result:", result);
-  } catch (error) {
-    console.error("[YouTube Digest Panel] seekTo error:", error);
-  }
+    const tab = await chrome.tabs.get(tabId);
+    if (youtubeTabId !== tabId || currentVideoId !== videoId || extractVideoId(tab.url) !== videoId) return;
+    await chrome.tabs.sendMessage(tabId, { action: 'goalSeek', seconds: numeric,
+      bvid: videoId.split('@p')[0], page: Number(videoId.split('@p')[1]) });
+  } catch { /* Do not fall back to another tab when the target disappeared. */ }
 }
 
 /**
@@ -1787,19 +1791,13 @@ function stopPlaybackTracking() {
  * YouTube tab and highlights + scrolls to the matching transcript entry.
  */
 async function playbackTrackingTick() {
+  const tabId = youtubeTabId, videoId = currentVideoId;
   try {
-    const result = await chrome.runtime.sendMessage({
-      action: "relayToContent",
-      payload: { action: "getCurrentTime" },
-    });
-
-    if (!result.success || !result.response) return;
-
-    const currentTime = result.response.currentTime || 0;
-    highlightActiveEntry(currentTime);
-  } catch (error) {
-    // Silently ignore — YouTube tab might be closed or navigated away
-  }
+    if (!tabId) return;
+    const result = await chrome.tabs.sendMessage(tabId, { action: 'getCurrentTime' });
+    if (youtubeTabId !== tabId || currentVideoId !== videoId) return;
+    highlightActiveEntry(result.currentTime || 0);
+  } catch { /* Closed or changed target; never poll another tab. */ }
 }
 
 /**
@@ -1985,6 +1983,7 @@ function renderTranscriptModeRows(segments, mode) {
     div.dataset.seconds = segment.start;
     div.dataset.segmentId = segment.id;
     div.dataset.segmentIndex = index;
+    div.dataset.cueIndexes = JSON.stringify(segment.cueIndexes);
 
     const minutes = Math.floor(segment.start / 60);
     const seconds = Math.floor(segment.start % 60);
@@ -2001,6 +2000,7 @@ function renderTranscriptModeRows(segments, mode) {
   });
 
   startPlaybackTracking();
+  applyGoalHighlights();
   return rows;
 }
 
@@ -2242,3 +2242,84 @@ globalThis.__YTD_TRANSCRIPT_TESTING__ = {
   renderSubtitleInlineMarkup,
   renderTranscriptSegmentContent,
 };
+
+function setupGoalPanel() {
+  goalController = GoalPanelController.createController({
+    send: message => chrome.runtime.sendMessage(message), storage: chrome.storage.local,
+    isCurrent: async target => {
+      if (youtubeTabId !== target.tabId || currentVideoId !== `${target.bvid}@p${target.page}`) return false;
+      try {
+        const tab = await chrome.tabs.get(target.tabId);
+        return tab.active && (panelWindowId == null || tab.windowId === panelWindowId) &&
+          extractVideoId(tab.url) === `${target.bvid}@p${target.page}`;
+      } catch { return false; }
+    },
+    seek: payload => chrome.runtime.sendMessage({ action: 'goalSeek', ...payload }),
+    onChange: state => {
+      goalView?.render(state);
+      if (state.phase === 'idle') goalView?.renderStructure([], 0);
+      const snapshot = goalController?.getSnapshot();
+      // Fresh Goal evidence supersedes stale display cache, without triggering AI features.
+      if (snapshot && state.phase !== 'idle' && `${snapshot.video.bvid}@p${snapshot.video.page}` === currentVideoId) {
+        const next = snapshot.cues.map(c => ({ text: c.text, start: c.start, duration: c.end - c.start }));
+        if (JSON.stringify(next) !== JSON.stringify((currentTranscript || []).map(c => ({ text: c.text, start: c.start, duration: c.duration })))) {
+          digestGeneration++;
+          isAnalysisLoading = false;
+          currentAnalysis = null;
+          goalView?.renderStructure([], currentVideoDuration);
+          currentTranscript = next;
+          currentTranscriptText = next.map(c => c.text).join(' ');
+          currentTranscriptTimestamped = next.map(c => `[${timestampLabel(c.start)}] ${c.text}`).join('\n');
+          currentTranscriptSourceType = snapshot.video.sourceType;
+          currentTranscriptLanguage = snapshot.video.language;
+          translationGeneration++;
+          currentTranscriptMode = 'original';
+          setTranscriptModeButtons('original');
+          renderTranscript();
+        }
+      }
+      applyGoalHighlights();
+    },
+  });
+  goalView = GoalPanelView.mount({ document,
+    onSubmit: goal => goalController.submit(goal), onClear: () => goalController.clear(),
+    onSettings: () => chrome.runtime.sendMessage({ action: 'openOptions' }),
+    onSeek: async segment => {
+      if (await goalController.jump(segment)) {
+        switchTab('transcript');
+        applyGoalHighlights();
+        const row = [...document.querySelectorAll('#transcriptList .transcript-entry')].find(el => {
+          try { return JSON.parse(el.dataset.cueIds || '[]').some(id => segment.cueIds.includes(id)); } catch { return false; }
+        });
+        row?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    },
+    getChapters: () => ({ chapters: currentAnalysis?.chapters || [], duration: currentVideoDuration }),
+  });
+  document.getElementById('generateOverviewBtn')?.addEventListener('click', async () => {
+    const config = await chrome.runtime.sendMessage({ action: 'checkConfig' });
+    if (!config.hasAiKey) {
+      document.getElementById('chapterList').textContent = '生成 AI 概览需要 API Key，请前往设置。'; return;
+    }
+    triggerAnalysis();
+  });
+}
+
+function applyGoalHighlights() {
+  if (!goalView || !goalController) return;
+  const snapshot = goalController.getSnapshot();
+  const state = goalController.getState();
+  document.querySelectorAll('#transcriptList .transcript-entry').forEach(row => {
+    try {
+      row.dataset.cueIds = JSON.stringify(snapshot ? JSON.parse(row.dataset.cueIndexes || '[]')
+        .map(i => snapshot.cues[i]?.cueId).filter(Boolean) : []);
+    } catch { row.dataset.cueIds = '[]'; }
+  });
+  const segments = state.phase === 'ai' ? state.response?.result?.recommendedSegments || []
+    : state.phase === 'local' ? (state.localResults || []).flatMap(s => s.occurrences || [s]) : [];
+  goalView.highlight(snapshot, segments);
+}
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  if (tabId === youtubeTabId) { goalController?.setContext(null); currentVideoId = null; }
+});

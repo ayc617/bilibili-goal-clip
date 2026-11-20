@@ -37,6 +37,7 @@
         <button class="tab active" data-tab="transcript">字幕</button>
         <button class="tab" data-tab="overview">概览</button>
         <button class="tab" data-tab="notes">笔记</button>
+        <button class="tab" data-tab="goal" type="button">目标导航</button>
       </div>
     </div>
 
@@ -130,6 +131,10 @@
 
         <!-- TAB: Overview (chapters + key quotes) - requires LLM -->
         <div class="tab-panel" data-panel="overview">
+          <div class="section">
+            <button class="enhance-btn" id="generateOverviewBtn" type="button">生成 AI 概览</button>
+            <p class="goal-caption">仅点击此按钮时生成概览；打开标签页不会调用模型。</p>
+          </div>
           <!-- Chapters -->
           <div class="section">
             <div class="section-title">章节时间线</div>
@@ -160,11 +165,60 @@
                 "
               >
                 <div class="quote-text" style="font-style: normal">
-                  打开概览后，将自动提取视频重点…
+                  点击“生成 AI 概览”后，将提取视频重点。
                 </div>
               </div>
             </div>
           </div>
+        </div>
+
+        <!-- TAB: Goal navigation. Requests run only on explicit form submission. -->
+        <div class="tab-panel" data-panel="goal">
+          <section class="section goal-input-section" aria-labelledby="goalHeading">
+            <h2 class="section-title" id="goalHeading">目标导航</h2>
+            <p class="goal-video-title" id="goalVideoTitle">正在识别当前视频…</p>
+            <form id="goalForm" novalidate>
+              <label class="goal-label" for="goalInput">你想解决的问题或学习目标</label>
+              <textarea id="goalInput" rows="4" maxlength="1000" placeholder="你希望通过这个视频解决什么问题？" aria-describedby="goalHelp goalStatus"></textarea>
+              <p class="goal-caption" id="goalHelp">输入问题或希望完成的任务，最多 1000 字。只有提交时才会分析。</p>
+              <div class="goal-actions">
+                <button class="enhance-btn goal-submit" id="goalSubmit" type="submit">生成观看路径</button>
+                <button class="enhance-btn" id="goalClear" type="button">清空目标</button>
+              </div>
+            </form>
+            <p class="goal-status" id="goalStatus" role="status" aria-live="polite"></p>
+            <div class="goal-key-notice" id="goalKeyNotice">
+              <p>当前显示的是关键词检索结果。配置 API Key 后，可以获得 AI 生成的观看顺序与内容缺口分析。</p>
+              <button class="enhance-btn" id="goalSettings" type="button">前往 API 设置</button>
+            </div>
+          </section>
+          <section class="section" aria-labelledby="goalPathHeading">
+            <h2 class="section-title" id="goalPathHeading">推荐观看路径</h2>
+            <p class="goal-caption" id="goalScope"></p>
+            <div id="goalPath"><p class="goal-empty">输入目标后，相关片段会显示在这里。</p></div>
+          </section>
+          <section class="section" id="goalCoverageSection" aria-labelledby="goalCoverageHeading" hidden>
+            <h2 class="section-title" id="goalCoverageHeading">目标覆盖</h2>
+            <div id="goalCoverage"></div>
+          </section>
+          <section class="section" id="goalGapsSection" aria-labelledby="goalGapsHeading" hidden>
+            <h2 class="section-title" id="goalGapsHeading">还需要补充什么</h2>
+            <div id="goalGaps"></div>
+            <div class="goal-searches" id="goalSearches"></div>
+            <p class="goal-caption">链接仅打开 B 站搜索页，未访问或验证其他视频。</p>
+          </section>
+          <section class="section" id="goalLimitsSection" aria-labelledby="goalLimitsHeading" hidden>
+            <h2 class="section-title" id="goalLimitsHeading">证据范围与局限</h2>
+            <div id="goalLimits"></div>
+          </section>
+          <details class="goal-disclosure section" id="goalStructureDetails">
+            <summary>已有视频结构</summary>
+            <div id="goalStructure"><p class="goal-empty">尚未生成完整 AI 章节。目标分析不会为此额外调用模型。</p></div>
+          </details>
+          <details class="goal-disclosure section" id="goalDebugDetails">
+            <summary>本次分析调试信息</summary>
+            <div id="goalDebug"><p class="goal-caption">尚未提交目标。</p></div>
+          </details>
         </div>
 
         <!-- TAB: Notes -->
@@ -208,6 +262,11 @@
     </button>
 
     <script src="settings.js"></script>
+    <script src="goal/transcript-index.js"></script>
+    <script src="goal/navigator.js"></script>
+    <script src="goal/cache.js"></script>
+    <script src="goal/controller.js"></script>
+    <script src="goal/view.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

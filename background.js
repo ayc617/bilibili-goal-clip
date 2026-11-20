@@ -14,6 +14,13 @@
 // Import safe defaults and validation helpers. Secret keys live in
 // chrome.storage.local and are never part of the extension source.
 importScripts("settings.js");
+importScripts("goal/transcript-index.js");
+importScripts("ai/goal-provider.js", "goal/navigator.js");
+
+const goalSnapshots = new Map();
+const goalRequests = new Map();
+const goalActiveRequests = new Map();
+const goalFetchGenerations = new Map();
 
 const DEBUG = false;
 const AI_PROVIDER_IDLE_TIMEOUT_MS = 50_000;
@@ -77,6 +84,8 @@ async function requestAiCompletion({
   maxTokens,
   temperature,
   responseFormat,
+  onRequest,
+  onUsage,
 }) {
   const settings = await getSettings();
   if (!settings.aiApiKey) {
@@ -121,6 +130,7 @@ async function requestAiCompletion({
   );
   resetIdleTimeout();
   try {
+    onRequest?.();
     const response = await fetch(
       YTD_SETTINGS.chatCompletionsUrl(),
       {
@@ -138,6 +148,7 @@ async function requestAiCompletion({
     resetIdleTimeout();
 
     const data = await readBoundedAiResponse(response, resetIdleTimeout);
+    onUsage?.(data?.usage);
     if (!response.ok) {
       const errorData = data && typeof data === "object" ? data : {};
       const error = new Error(
@@ -277,6 +288,11 @@ function updatePanelForTab(tabId, url) {
 
 // A tab navigated to a new URL.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url || changeInfo.status === "loading") {
+    goalSnapshots.delete(tabId);
+    goalActiveRequests.delete(tabId);
+    goalFetchGenerations.delete(tabId);
+  }
   if (!changeInfo.url) return; // ignore title/favicon-only updates
   updatePanelForTab(tabId, changeInfo.url);
 });
@@ -300,6 +316,22 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
  * This is like a switchboard — different "actions" trigger different handlers.
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "goalSeek") {
+    handleGoalSeek(message).then(sendResponse).catch(() => sendResponse({ success: false, error: "STALE_VIDEO" }));
+    return true;
+  }
+  if (message.action === "analyzeGoal") {
+    handleAnalyzeGoal(message).then(sendResponse).catch(() =>
+      sendResponse({ success: false, error: "GOAL_ERROR", message: "目标分析失败。" }));
+    return true;
+  }
+  // Independent, key-free Goal entry point. Never falls back to ASR or AI.
+  if (message.action === "fetchGoalTranscript") {
+    handleFetchGoalTranscript(message)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
   // We need to return true to indicate we'll respond asynchronously
   if (message.action === "fetchTranscript") {
     handleFetchTranscript(message.videoId, message.videoUrl, message.pageNumber)
@@ -389,6 +421,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({
           hasSupadataKey: true,
           hasAiKey: !!settings.aiApiKey,
+          aiModel: settings.aiModel,
         }),
       )
       .catch((error) => sendResponse({ error: error.message }));
@@ -1171,6 +1204,12 @@ function bdNormalizeSubtitleDocument(payload, track, provider) {
   const { sourceType, sourceLabel } = bdClassifyBilibiliTrack(track);
   return {
     success: true,
+    // Preserve original boundaries/text for Goal evidence, before display normalization.
+    evidenceCues: body.filter(chunk => String(chunk?.content ?? chunk?.text ?? "").trim()).map(chunk => ({
+      start: chunk.from ?? chunk.start,
+      end: chunk.to ?? chunk.end,
+      text: String(chunk.content ?? chunk.text),
+    })),
     transcript,
     segments: transcript,
     transcriptText: plain.trim(),
@@ -1214,6 +1253,8 @@ async function bdResolveTracks(providerResult, info) {
         track,
         providerResult.provider,
       );
+      result.video = { ...info };
+      result.subtitleTrackId = track.id_str || track.id || null;
       bdSubtitleLog(
         `[Subtitle] Found ${result.sourceLabel} via ${providerResult.provider} lan=${result.language || "(unknown)"}`,
       );
@@ -1274,6 +1315,7 @@ async function handleFetchTranscript(
   videoId,
   videoUrl = "",
   requestedPage = 1,
+  { allowAsr = true } = {},
 ) {
   try {
     YTD_SETTINGS.canonicalBilibiliUrl(videoId);
@@ -1289,6 +1331,9 @@ async function handleFetchTranscript(
       error.bilibiliCode = view.code;
       throw error;
     }
+    if (!allowAsr && view.data.bvid && view.data.bvid !== videoId) {
+      throw new Error("BVID 与请求的视频不匹配。");
+    }
 
     let part = Math.max(1, Number(requestedPage) || 1);
     try {
@@ -1298,6 +1343,10 @@ async function handleFetchTranscript(
       );
     } catch {}
 
+    // Preserve legacy fallback, but never label P1 as a requested Goal part.
+    if (!allowAsr && (!Number.isInteger(part) || !view.data.pages?.[part - 1])) {
+      throw new Error("当前分 P 不存在。");
+    }
     const page = view.data.pages?.[part - 1] || view.data.pages?.[0];
     if (!page?.cid) throw new Error("无法识别当前分 P 的 CID。");
 
@@ -1348,8 +1397,8 @@ async function handleFetchTranscript(
       };
     }
 
-    const settings = await getSettings();
-    if (settings.asrApiKey) {
+    const settings = allowAsr ? await getSettings() : {};
+    if (allowAsr && settings.asrApiKey) {
       bdSubtitleLog("[Subtitle] Bilibili subtitle unavailable; falling back to ASR.");
       try {
         return bdWithAsrMetadata(
@@ -1369,7 +1418,9 @@ async function handleFetchTranscript(
       success: false,
       error: "NO_TRANSCRIPT",
       message:
-        "当前视频未找到可用字幕，如需识别无字幕视频，请先配置 ASR。",
+        allowAsr
+          ? "当前视频未找到可用字幕，如需识别无字幕视频，请先配置 ASR。"
+          : "当前视频未找到可用 B站字幕，Goal 本地检索不会启动 ASR。",
     };
   } catch (error) {
     console.error("[Subtitle] Transcript fetch error:", error);
@@ -1390,6 +1441,39 @@ async function handleFetchTranscript(
 }
 
 // === BILIBILI SUBTITLE PROVIDER V2 END ===
+
+async function handleFetchGoalTranscript(message) {
+  if (message.page != null && (!Number.isSafeInteger(message.page) || message.page < 1)) {
+    return { success: false, error: "INVALID_VIDEO_PAGE" };
+  }
+  const fetchGeneration = Symbol();
+  if (Number.isInteger(message.tabId)) {
+    goalFetchGenerations.set(message.tabId, fetchGeneration);
+    goalSnapshots.delete(message.tabId);
+    goalActiveRequests.delete(message.tabId);
+  }
+  const result = await handleFetchTranscript(
+    message.bvid, message.videoUrl || "", message.page ?? 1, { allowAsr: false },
+  );
+  if (!result.success) return result;
+  if ((message.cid != null && String(message.cid) !== String(result.video.cid)) ||
+      (message.page != null && message.page !== result.video.page)) {
+    return { success: false, error: "VIDEO_IDENTITY_MISMATCH" };
+  }
+  const snapshot = await GoalTranscriptIndex.createSnapshot({
+    video: result.video, cues: result.evidenceCues,
+    language: result.language, sourceType: result.sourceType, provider: result.provider,
+  });
+  if (Number.isInteger(message.tabId)) {
+    if (!await goalTabMatches(message.tabId, snapshot.video) ||
+        goalFetchGenerations.get(message.tabId) !== fetchGeneration) {
+      return { success: false, error: "STALE_VIDEO" };
+    }
+    goalSnapshots.set(message.tabId, snapshot);
+    goalActiveRequests.delete(message.tabId);
+  }
+  return { ...result, success: true, snapshot };
+}
 
 
 /**
@@ -2304,3 +2388,111 @@ globalThis.__YTD_TRANSLATION_TESTING__ = {
   normalizeTranslatedSegmentBatch,
   handleTranslateContent,
 };
+
+// Goal-only entry. Existing overview, note and translation handlers remain unchanged.
+async function goalTabMatches(tabId, video) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const url = new URL(tab.url);
+    return url.hostname === 'www.bilibili.com' &&
+      url.pathname.match(/^\/video\/(BV[A-Za-z0-9]{10})(?:\/|$)/)?.[1] === video.bvid &&
+      (Number(url.searchParams.get('p')) || 1) === video.page;
+  } catch { return false; }
+}
+
+function handleAnalyzeGoal(message) {
+  const { tabId, requestId, goal, expectedIdentity } = message;
+  if (typeof goal !== 'string' || !goal.trim() || goal.length > GoalNavigator.LIMITS.goalChars) {
+    return Promise.resolve({ success: false, error: 'INVALID_GOAL' });
+  }
+  if (!Number.isInteger(tabId) || typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(requestId)) {
+    return Promise.resolve({ success: false, error: 'INVALID_REQUEST' });
+  }
+  const key = `${tabId}:${requestId}`;
+  const fingerprint = JSON.stringify([goal, ...['bvid', 'cid', 'page', 'language', 'sourceType', 'provider', 'transcriptHash']
+    .map(key => expectedIdentity?.[key])]);
+  if (goalRequests.has(key)) {
+    const prior = goalRequests.get(key);
+    return prior.fingerprint === fingerprint ? prior.promise.then(async result => {
+      const current = goalSnapshots.get(tabId);
+      return current && goalActiveRequests.get(tabId) === requestId &&
+        GoalNavigator.sameIdentity(GoalNavigator.identity(current), expectedIdentity) &&
+        await goalTabMatches(tabId, current.video) ? result : { success: false, error: 'STALE_VIDEO', requestId };
+    })
+      : Promise.resolve({ success: false, error: 'REQUEST_ID_REUSED' });
+  }
+  for (const [id, entry] of goalRequests) {
+    if (goalRequests.size < 64) break;
+    if (entry.done) goalRequests.delete(id);
+  }
+  if (goalRequests.size >= 64) return Promise.resolve({ success: false, error: 'BUSY' });
+  const snapshot = goalSnapshots.get(tabId);
+  if (!snapshot || !GoalNavigator.sameIdentity(GoalNavigator.identity(snapshot), expectedIdentity)) {
+    return Promise.resolve({ success: false, error: 'STALE_VIDEO' });
+  }
+  goalActiveRequests.set(tabId, requestId);
+  const entry = { fingerprint, done: false };
+  entry.promise = (async () => {
+    const startedAt = Date.now();
+    const diagnostics = { cacheHit: false, modelRequested: false, inputTokens: null, outputTokens: null };
+    try {
+      const engine = GoalNavigator.createNavigator({
+        provider: GoalAiProvider.createByokProvider(options => requestAiCompletion({ ...options,
+          onRequest: () => { diagnostics.modelRequested = true; },
+          onUsage: usage => {
+            const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+            diagnostics.inputTokens = count(usage?.prompt_tokens);
+            diagnostics.outputTokens = count(usage?.completion_tokens);
+          },
+        })),
+        loadSystemPrompt: () => loadPromptSection('goal-navigation.md', 'System prompt'),
+      });
+      const result = await engine.analyze({ goal, snapshot, requestId, expectedIdentity,
+        getCurrentIdentity: async () => {
+          if (goalActiveRequests.get(tabId) !== requestId || !await goalTabMatches(tabId, snapshot.video)) return null;
+          const current = goalSnapshots.get(tabId);
+          return current ? GoalNavigator.identity(current) : null;
+        },
+      });
+      return { success: true, ...result, diagnostics: { ...diagnostics, elapsedMs: Date.now() - startedAt } };
+    } catch (error) {
+      const safeCodes = ['INVALID_GOAL', 'INVALID_REQUEST', 'INVALID_SNAPSHOT', 'STALE_VIDEO', 'INPUT_TOO_LARGE',
+        'INVALID_RESULT', 'INVALID_EVIDENCE', 'INVALID_JSON', 'EMPTY_RESPONSE', 'NO_AI_KEY', 'UNAUTHORIZED',
+        'RATE_LIMITED', 'TIMEOUT', 'PROVIDER_ERROR'];
+      return { success: false, requestId, identity: expectedIdentity,
+        error: safeCodes.includes(error.code) ? error.code : 'GOAL_ERROR',
+        message: '目标分析未完成，请检查错误类型后手动重试。',
+        diagnostics: { ...diagnostics, elapsedMs: Date.now() - startedAt } };
+    } finally { entry.done = true; }
+  })();
+  goalRequests.set(key, entry);
+  return entry.promise;
+}
+
+chrome.tabs.onRemoved?.addListener((tabId) => {
+  goalSnapshots.delete(tabId);
+  goalActiveRequests.delete(tabId);
+  goalFetchGenerations.delete(tabId);
+});
+
+// Goal jumps never use the legacy 'any Bilibili tab' fallback.
+async function handleGoalSeek({ tabId, identity, seconds }) {
+  const snapshot = goalSnapshots.get(tabId);
+  if (!snapshot || !GoalNavigator.sameIdentity(GoalNavigator.identity(snapshot), identity) ||
+      !Number.isFinite(seconds) || !snapshot.cues.some(c => c.start === seconds) ||
+      !await goalTabMatches(tabId, snapshot.video)) return { success: false, error: 'STALE_VIDEO' };
+  const viewResponse = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(snapshot.video.bvid)}`,
+    { credentials: 'include', cache: 'no-store' });
+  const view = await viewResponse.json();
+  if (!viewResponse.ok || view.code !== 0 ||
+      String(view.data?.pages?.[snapshot.video.page - 1]?.cid) !== snapshot.video.cid ||
+      goalSnapshots.get(tabId) !== snapshot || !await goalTabMatches(tabId, snapshot.video)) {
+    return { success: false, error: 'STALE_VIDEO' };
+  }
+  const response = await chrome.tabs.sendMessage(tabId, {
+    action: 'goalSeek', bvid: snapshot.video.bvid, page: snapshot.video.page,
+    cid: snapshot.video.cid, seconds,
+  });
+  if (goalSnapshots.get(tabId) !== snapshot || !await goalTabMatches(tabId, snapshot.video)) return { success: false, error: 'STALE_VIDEO' };
+  return response?.success ? { success: true } : { success: false, error: response?.error || 'STALE_VIDEO' };
+}
